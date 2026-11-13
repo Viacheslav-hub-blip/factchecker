@@ -3,6 +3,7 @@
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from threading import Lock
 from uuid import UUID, uuid4
 
@@ -14,6 +15,7 @@ from gigachat.exceptions import GigaChatException, ResponseError
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage
 from langchain_gigachat import GigaChat
+from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent import Route, build_graph
@@ -44,14 +46,22 @@ class ChatResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Получает приложение и готовит его к проверке фактов."""
+    """Получает приложение, открывает SQLite и готовит его к проверке фактов."""
     load_dotenv()
     if not os.getenv("TAVILY_API_KEY"):
         raise RuntimeError("Укажите TAVILY_API_KEY в .env.")
     model = GigaChat(model=os.getenv("GIGACHAT_MODEL", "GigaChat-3-Pro"), timeout=45)
-    app.state.graph = build_graph(model, search_web, extract_pages, search_wikipedia)
-    app.state.chat_lock = Lock()
-    yield
+    database = Path(os.getenv("FACTCHECKER_DB", str(Path(__file__).with_name("factchecker.sqlite3"))))
+    if not database.is_absolute():
+        database = Path(__file__).parent / database
+    database.parent.mkdir(parents=True, exist_ok=True)
+    with SqliteSaver.from_conn_string(str(database)) as checkpointer:
+        checkpointer.setup()
+        app.state.graph = build_graph(
+            model, search_web, extract_pages, search_wikipedia, checkpointer
+        )
+        app.state.chat_lock = Lock()
+        yield
 
 
 app = FastAPI(title="FactChecker", lifespan=lifespan)

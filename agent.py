@@ -1,5 +1,5 @@
-"""Поиск и проверка фактов. Функции: build_graph, route_request, select_route, clarify,
-researcher, critic, after_review, publish, insufficient.
+"""Поиск и проверка фактов. Функции: build_graph, route_request, select_route,
+clarify, capabilities, researcher, critic, after_review, publish, insufficient.
 """
 
 import json
@@ -9,13 +9,13 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic import BaseModel, Field
 
 
-Route = Literal["clarify", "research"]
+Route = Literal["clarify", "research", "capabilities"]
 MAX_REVIEW_ATTEMPTS = 2
 
 ROUTER_PROMPT = """
@@ -33,12 +33,12 @@ ROUTER_PROMPT = """
 зависит ответ, выбери clarify. Задай один вопрос о недостающей детали.
 Оставь claim и query пустыми. Фактический ответ формируется после поиска.
 Если в сообщении есть факт для проверки, обрабатывай его даже после приветствия.
-Для простых реплик выбери clarify, оставь claim и query пустыми и запиши в
+Если пользователь спрашивает о возможностях агента, выбери capabilities.
+Если он одновременно спрашивает о возможностях и задаёт вопрос по факту,
+выбери research. Для простых реплик выбери clarify, оставь claim и query пустыми и запиши в
 question готовый ответ пользователю. Для близких формулировок также бери
 подходящую реплику целиком, сохраняя пример и формулировку:
 «Привет» → «Привет! Я FactChecker. Пришли утверждение, и я проверю его по источникам.»
-Вопрос о возможностях («Что ты умеешь?», «Расскажи о своих возможностях»,
-«Чем можешь помочь?», «Что ты делаешь?») → «Я проверяю утверждения: ищу источники, сравниваю их и объясняю вывод со ссылками.»
 Вопрос о порядке работы («Как тобой пользоваться?», «С чего начать?») →
 «Напиши утверждение или вопрос о факте. Например: “Правда ли, что Венера вращается медленнее Земли?”»
 Благодарность без нового вопроса («Спасибо», «Благодарю») → «Пожалуйста!»
@@ -87,9 +87,9 @@ CRITIC_PROMPT = """
 
 
 class RouteDecision(BaseModel):
-    """По переписке определяет, что ответить сразу или какой факт проверить."""
+    """По переписке выбирает короткий ответ, описание возможностей или проверку факта."""
 
-    route: Route = Field(description="research для проверяемого факта, clarify для уточнения или простой реплики")
+    route: Route = Field(description="research для факта, clarify для уточнения, capabilities для вопроса о возможностях агента")
     question: str = Field(description="Уточняющий вопрос или готовая вежливая реплика. При поиске оставь пустым.")
     claim: str = Field(description="Для research обязателен полный вопрос или факт с контекстом. Для clarify пустая строка.")
     query: str = Field(description="Текст для поиска. Для короткого ответа оставь пустым.")
@@ -122,8 +122,9 @@ def build_graph(
     search_web: BaseTool,
     extract_pages: BaseTool,
     search_wikipedia: BaseTool,
+    checkpointer: BaseCheckpointSaver,
 ) -> CompiledStateGraph:
-    """Получает модель и средства поиска. Собирает программу, которая помнит переписку."""
+    """Получает модель, средства поиска и хранилище бесед. Возвращает собранный граф."""
     router = model.with_structured_output(RouteDecision, method="json_schema").with_retry(
         retry_if_exception_type=(OutputParserException,), stop_after_attempt=2
     )
@@ -164,6 +165,14 @@ def build_graph(
         """Берёт готовый текст и возвращает короткий ответ или вопрос."""
         question = state["question"].strip() or "Что именно нужно проверить?"
         return {"messages": [AIMessage(content=question)]}
+
+    def capabilities(state: FactCheckState) -> dict:
+        """Принимает вопрос о возможностях. Возвращает краткое описание агента."""
+        return {"messages": [AIMessage(content=(
+            "Я проверяю факты: ищу сведения в интернете и Википедии, "
+            "сопоставляю источники и отвечаю со ссылками. Можно задавать "
+            "уточняющие вопросы в рамках одной беседы."
+        ))]}
 
     def researcher(state: FactCheckState) -> dict:
         """Принимает запрос и замечания. Возвращает источники и новый черновик."""
@@ -239,17 +248,20 @@ def build_graph(
     graph = StateGraph(FactCheckState)
     graph.add_node("route_request", route_request)
     graph.add_node("clarify", clarify)
+    graph.add_node("capabilities", capabilities)
     graph.add_node("researcher", researcher)
     graph.add_node("critic", critic)
     graph.add_node("publish", publish)
     graph.add_node("insufficient", insufficient)
     graph.add_edge(START, "route_request")
     graph.add_conditional_edges(
-        "route_request", select_route, {"clarify": "clarify", "research": "researcher"}
+        "route_request", select_route,
+        {"clarify": "clarify", "research": "researcher", "capabilities": "capabilities"}
     )
     graph.add_edge("clarify", END)
+    graph.add_edge("capabilities", END)
     graph.add_edge("researcher", "critic")
     graph.add_conditional_edges("critic", after_review)
     graph.add_edge("publish", END)
     graph.add_edge("insufficient", END)
-    return graph.compile(checkpointer=InMemorySaver())
+    return graph.compile(checkpointer=checkpointer)
