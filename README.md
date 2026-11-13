@@ -4,8 +4,6 @@
 
 ## Быстрый запуск на Windows
 
-Установите зависимости командой `uv pip install --python .venv/Scripts/python.exe -r requirements.txt`. Укажите ключ Cloud.ru в `CLOUD_RU_API_KEY`, а ключ Tavily в `TAVILY_API_KEY` в локальном файле `.env`. Программа использует модель `GigaChat/GigaChat-3-Pro` через Cloud.ru.
-
 Если `.venv` и `.env` уже настроены, откройте PowerShell в папке проекта и выполните:
 
 ```powershell
@@ -13,6 +11,25 @@
 ```
 
 После запуска откройте [страницу проверки запросов](http://127.0.0.1:8000/docs). Чтобы остановить программу, нажмите **Ctrl+C** в PowerShell.
+
+## Установка с нуля
+
+Установите Git и Python 3.11 или новее. Если проект ещё не скачан, выполните в PowerShell:
+
+```powershell
+git clone https://github.com/Viacheslav-hub-blip/factchecker.git
+Set-Location factchecker
+```
+
+Из папки проекта выполните:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+```
+
+Откройте `.env` и укажите ключ GigaChat в `GIGACHAT_CREDENTIALS`, а ключ Tavily в `TAVILY_API_KEY`. Этот файл хранится на вашем компьютере. По умолчанию используется `GigaChat-3-Pro`. Для доступа к `GigaChat-3-Ultra` через ключ для физического лица укажите `GIGACHAT_MODEL=GigaChat-3-Ultra` и `GIGACHAT_SCOPE=GIGACHAT_API_PERS`. Если при подключении появится ошибка проверки сертификата, укажите путь к сертификату в `GIGACHAT_CA_BUNDLE_FILE`. Затем выполните команду быстрого запуска.
 
 ## Пример диалога
 
