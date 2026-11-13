@@ -1,13 +1,13 @@
 # FactChecker
 
-Учебный агент на GigaChat, LangGraph и FastAPI. Принимает утверждение, ищет страницы через Tavily Search, читает их через Tavily Extract и возвращает вывод со ссылками.
+Учебный агент на GigaChat, LangGraph и FastAPI. Принимает утверждение, ищет и читает источники через Tavily, готовит черновик и передаёт его критику для перепроверки.
 
 ## Быстрый запуск на Windows
 
 Если `.venv` и `.env` уже настроены, откройте PowerShell в папке проекта и выполните:
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8000
+.\.venv\Scripts\python.exe main.py
 ```
 
 После запуска откройте [Swagger UI](http://127.0.0.1:8000/docs). Для остановки сервера нажмите **Ctrl+C** в PowerShell.
@@ -45,15 +45,6 @@ if (-not (Test-Path .env)) { Copy-Item .env.example .env }
    }
    ```
 
-3. С тем же `thread_id` спросите о результате. Ожидаемый маршрут — `conversation`.
-
-   ```json
-   {
-     "message": "К какому выводу ты пришёл в прошлой проверке?",
-     "thread_id": "ВСТАВЬТЕ_UUID"
-   }
-   ```
-
 В ответе API поле `route` показывает выбранный маршрут, `answer` содержит ответ, а `thread_id` нужен для следующего сообщения.
 
 ## Как устроен граф
@@ -62,10 +53,13 @@ if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 flowchart TD
     A[Новое сообщение] --> B[GigaChat выбирает маршрут по истории]
     B -->|clarify| C[Уточняющий вопрос]
-    B -->|conversation| D[Ответ по истории]
-    B -->|research| E[Tavily Search, Tavily Extract, вывод GigaChat]
+    B -->|research| E[Researcher ищет источники и готовит черновик]
+    E --> F[Critic сверяет черновик с источниками]
+    F -->|Одобрено| P[Ответ со ссылками]
+    F -->|Отклонение и новый поисковый запрос| E
+    F -->|Лимит попыток| N[Недостаточно данных]
 ```
 
 `MessagesState` добавляет новые сообщения в историю. `InMemorySaver` хранит состояние в процессе сервера по `thread_id`. Запрос без идентификатора создаёт отдельный диалог. После остановки сервера история очищается. Запускайте один процесс Uvicorn. [Память LangGraph](https://docs.langchain.com/oss/python/langgraph/add-memory#add-short-term-memory)
 
-Для скринкаста курса покажите три маршрута, два вызова Tavily в ветке проверки и продолжение диалога с тем же `thread_id`.
+`researcher` вызывает Tavily Search и Tavily Extract, затем готовит черновик. При отклонении `critic` возвращает замечания и новый поисковый запрос. `researcher` снова ищет, добавляет новые страницы к ранее найденным и готовит обновлённый черновик. Лимит — два раунда. В историю диалога попадает итоговая реплика.
