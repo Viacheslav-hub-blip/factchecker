@@ -1,4 +1,4 @@
-"""Приём сообщений и отправка ответов. Функции: lifespan, chat, chat_error."""
+"""Приём сообщений и отправка ответов. Функции: lifespan, openapi_with_chat_example, chat, chat_error."""
 
 import logging
 import os
@@ -26,13 +26,11 @@ logger = logging.getLogger("uvicorn.error")
 class ChatRequest(BaseModel):
     """Сообщение пользователя и номер беседы, если она уже начата."""
 
-    model_config = ConfigDict(
-        str_strip_whitespace=True,
-        json_schema_extra={"examples": [{"message": "Что ты умеешь?"}]},
-    )
+    model_config = ConfigDict(str_strip_whitespace=True)
     message: str = Field(min_length=1, max_length=2000)
     thread_id: UUID | None = Field(
-        default=None, description="Чтобы продолжить беседу, укажите её номер из прошлого ответа."
+        default=None,
+        description="Оставьте null для новой беседы. Для продолжения укажите номер из прошлого ответа.",
     )
 
 
@@ -57,6 +55,19 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="FactChecker", lifespan=lifespan)
+default_openapi = app.openapi
+
+
+def openapi_with_chat_example() -> dict:
+    """Возвращает описание запросов с примером новой беседы для Swagger."""
+    schema = default_openapi()
+    schema["components"]["schemas"]["ChatRequest"]["examples"] = [
+        {"message": "Что ты умеешь?", "thread_id": None},
+    ]
+    return schema
+
+
+app.openapi = openapi_with_chat_example
 
 
 @app.post(
