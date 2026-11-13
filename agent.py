@@ -1,22 +1,24 @@
-"""Поиск и проверка фактов. Функции: build_graph, route_request, select_route,
+"""Поиск и проверка фактов. Функции: build_graph, complete, decide, route_request, select_route,
 clarify, capabilities, researcher, critic, after_review, publish, insufficient.
 """
 
 import json
-from typing import Literal
+from typing import Literal, TypeVar
 
 from langchain_core.exceptions import OutputParserException
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from pydantic import BaseModel, Field
+from openai import OpenAI
+from pydantic import BaseModel, Field, ValidationError
 
 
 Route = Literal["clarify", "research", "capabilities"]
 MAX_REVIEW_ATTEMPTS = 2
+MODEL_NAME = "GigaChat/GigaChat-3-Pro"
+Decision = TypeVar("Decision", bound=BaseModel)
 
 ROUTER_PROMPT = """
 Обработай message. В history лежат предыдущие реплики этой беседы.
@@ -118,19 +120,36 @@ class FactCheckState(MessagesState, total=False):
 
 
 def build_graph(
-    model: BaseChatModel,
+    client: OpenAI,
     search_web: BaseTool,
     extract_pages: BaseTool,
     search_wikipedia: BaseTool,
     checkpointer: BaseCheckpointSaver,
 ) -> CompiledStateGraph:
-    """Получает модель, средства поиска и хранилище бесед. Возвращает собранный граф."""
-    router = model.with_structured_output(RouteDecision, method="json_schema").with_retry(
-        retry_if_exception_type=(OutputParserException,), stop_after_attempt=2
-    )
-    reviewer = model.with_structured_output(ReviewDecision, method="json_schema").with_retry(
-        retry_if_exception_type=(OutputParserException,), stop_after_attempt=2
-    )
+    """Получает клиент Cloud.ru, средства поиска и хранилище. Возвращает граф."""
+
+    def complete(prompt: str, data: dict) -> str:
+        """Получает инструкцию и данные запроса. Возвращает текст модели."""
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
+            ],
+        )
+        return (response.choices[0].message.content or "").strip() if response.choices else ""
+
+    def decide(prompt: str, data: dict, schema: type[Decision]) -> Decision:
+        """Получает инструкцию, данные и схему. Возвращает проверенное решение модели."""
+        fields = json.dumps(schema.model_json_schema(), ensure_ascii=False)
+        instruction = f"{prompt}\nВерни только объект JSON по схеме, без разметки:\n{fields}"
+        for _ in range(2):
+            answer = complete(instruction, data)
+            try:
+                return schema.model_validate_json(answer)
+            except ValidationError as error:
+                last_error = error
+        raise OutputParserException("Модель не вернула JSON по заданной схеме.") from last_error
 
     def route_request(state: FactCheckState) -> dict:
         """Читает переписку и решает, ответить сразу или искать сведения."""
@@ -139,10 +158,7 @@ def build_graph(
             "message": latest.text,
             "history": [{"role": message.type, "text": message.text} for message in history],
         }
-        decision = router.invoke([
-            SystemMessage(content=ROUTER_PROMPT),
-            HumanMessage(content=json.dumps(request, ensure_ascii=False)),
-        ])
+        decision = decide(ROUTER_PROMPT, request, RouteDecision)
         if decision.route == "research" and not (decision.claim.strip() and decision.query.strip()):
             decision = RouteDecision(
                 route="clarify", question="Какое утверждение нужно проверить?", claim="", query=""
@@ -191,28 +207,22 @@ def build_graph(
         collected = list(sources.values())
         if len(collected) < 2:
             return {"sources": collected, "draft": ""}
-        response = model.invoke([
-            SystemMessage(content=RESEARCHER_PROMPT),
-            HumanMessage(content=json.dumps({
-                "claim": state["claim"],
-                "sources": collected,
-                "previous_draft": state["draft"],
-                "feedback": state["feedback"],
-            }, ensure_ascii=False)),
-        ])
-        return {"sources": collected, "draft": response.text.strip()}
+        draft = complete(RESEARCHER_PROMPT, {
+            "claim": state["claim"],
+            "sources": collected,
+            "previous_draft": state["draft"],
+            "feedback": state["feedback"],
+        })
+        return {"sources": collected, "draft": draft}
 
     def critic(state: FactCheckState) -> dict:
         """Принимает черновик и источники. Возвращает решение и данные для повторного поиска."""
-        decision = reviewer.invoke([
-            SystemMessage(content=CRITIC_PROMPT),
-            HumanMessage(content=json.dumps({
-                "claim": state["claim"],
-                "draft": state["draft"],
-                "sources": state["sources"],
-                "previous_query": state["query"],
-            }, ensure_ascii=False)),
-        ])
+        decision = decide(CRITIC_PROMPT, {
+            "claim": state["claim"],
+            "draft": state["draft"],
+            "sources": state["sources"],
+            "previous_query": state["query"],
+        }, ReviewDecision)
         approved = decision.approved and bool(state["draft"])
         feedback = decision.feedback.strip() or "Найди дополнительные источники по утверждению."
         next_query = decision.next_query.strip()[:400]

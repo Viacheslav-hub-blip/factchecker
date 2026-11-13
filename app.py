@@ -8,14 +8,12 @@ from threading import Lock
 from uuid import UUID, uuid4
 
 import httpx
-import httpx2
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from gigachat.exceptions import GigaChatException, ResponseError
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage
-from langchain_gigachat import GigaChat
 from langgraph.checkpoint.sqlite import SqliteSaver
+from openai import APIError, APIStatusError, APITimeoutError, OpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent import Route, build_graph
@@ -50,15 +48,24 @@ async def lifespan(app: FastAPI):
     load_dotenv()
     if not os.getenv("TAVILY_API_KEY"):
         raise RuntimeError("Укажите TAVILY_API_KEY в .env.")
-    model = GigaChat(model=os.getenv("GIGACHAT_MODEL", "GigaChat-3-Pro"), timeout=45)
+    api_key = os.getenv("CLOUD_RU_API_KEY")
+    if not api_key:
+        raise RuntimeError("Укажите CLOUD_RU_API_KEY в .env.")
     database = Path(os.getenv("FACTCHECKER_DB", str(Path(__file__).with_name("factchecker.sqlite3"))))
     if not database.is_absolute():
         database = Path(__file__).parent / database
     database.parent.mkdir(parents=True, exist_ok=True)
-    with SqliteSaver.from_conn_string(str(database)) as checkpointer:
+    with (
+        OpenAI(
+            api_key=api_key,
+            base_url="https://foundation-models.api.cloud.ru/v1",
+            timeout=45,
+        ) as client,
+        SqliteSaver.from_conn_string(str(database)) as checkpointer,
+    ):
         checkpointer.setup()
         app.state.graph = build_graph(
-            model, search_web, extract_pages, search_wikipedia, checkpointer
+            client, search_web, extract_pages, search_wikipedia, checkpointer
         )
         app.state.chat_lock = Lock()
         yield
@@ -98,7 +105,7 @@ def chat(body: ChatRequest, request: Request) -> ChatResponse:
                 {"messages": [HumanMessage(content=body.message)]},
                 config={"configurable": {"thread_id": str(thread_id)}},
             )
-    except (GigaChatException, httpx.HTTPError, httpx2.HTTPError, OutputParserException) as error:
+    except (APIError, httpx.HTTPError, OutputParserException) as error:
         raise chat_error(error) from error
 
     return ChatResponse(
@@ -111,19 +118,19 @@ def chat(body: ChatRequest, request: Request) -> ChatResponse:
 def chat_error(error: Exception) -> HTTPException:
     """Получает ошибку проверки. Возвращает понятное сообщение для пользователя."""
     if isinstance(error, OutputParserException):
-        logger.warning("GigaChat: не удалось разобрать ответ модели.")
-        return HTTPException(502, "GigaChat вернул ответ в неожиданном формате. Повторите запрос.")
+        logger.warning("Cloud.ru: не удалось разобрать ответ модели.")
+        return HTTPException(502, "Модель вернула ответ в неожиданном формате. Повторите запрос.")
 
-    service = "GigaChat"
-    status = error.status_code if isinstance(error, ResponseError) else None
-    if isinstance(error, (httpx.HTTPError, httpx2.HTTPError)):
+    service = "Cloud.ru"
+    status = error.status_code if isinstance(error, APIStatusError) else None
+    if isinstance(error, httpx.HTTPError):
         if error.request.url.host == "api.tavily.com":
             service = "Tavily"
-        if isinstance(error, (httpx.HTTPStatusError, httpx2.HTTPStatusError)):
+        if isinstance(error, httpx.HTTPStatusError):
             status = error.response.status_code
 
     logger.warning("%s: %s, код ответа: %s", service, type(error).__name__, status)
-    if isinstance(error, (httpx.TimeoutException, httpx2.TimeoutException)):
+    if isinstance(error, (httpx.TimeoutException, APITimeoutError)):
         return HTTPException(504, f"{service} не ответил вовремя. Повторите запрос.")
     if status == 429:
         return HTTPException(503, f"{service} ограничил частоту запросов. Попробуйте чуть позже.")
