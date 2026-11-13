@@ -2,35 +2,6 @@
 
 Проект для проверки фактов. Напишите утверждение или задайте вопрос. Программа найдёт источники, сверит с ними ответ и приведёт ссылки. Например, на вопрос «Кто первым ступил на Луну?» ответ начнётся так: «Нил Армстронг первым ступил на Луну».
 
-## Быстрый запуск на Windows
-
-Если `.venv` и `.env` уже настроены, откройте PowerShell в папке проекта и выполните:
-
-```powershell
-.\.venv\Scripts\python.exe main.py
-```
-
-После запуска откройте [страницу проверки запросов](http://127.0.0.1:8000/docs). Чтобы остановить программу, нажмите **Ctrl+C** в PowerShell.
-
-## Установка с нуля
-
-Установите Git и Python 3.11 или новее. Если проект ещё не скачан, выполните в PowerShell:
-
-```powershell
-git clone https://github.com/Viacheslav-hub-blip/factchecker.git
-Set-Location factchecker
-```
-
-Из папки проекта выполните:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-```
-
-Откройте `.env` и укажите ключ OpenRouter в `OPENROUTER_API_KEY`, а ключ Tavily в `TAVILY_API_KEY`. По умолчанию используется `deepseek/deepseek-v4.1-flash-1017`. Чтобы выбрать другую модель с поддержкой JSON Schema, задайте `OPENROUTER_MODEL`. Затем выполните команду быстрого запуска.
-
 ## Пример диалога
 
 На [странице проверки запросов](http://127.0.0.1:8000/docs) откройте `POST /chat` и нажмите **Try it out**. Вставьте текст запроса и нажмите **Execute**.
