@@ -1,9 +1,10 @@
-"""Поиск и проверка фактов. Функции: build_graph, route_request, select_route,
+"""Поиск и проверка фактов. Функции: request_decision, build_graph, route_request, select_route,
 clarify, capabilities, researcher, critic, after_review, publish, insufficient.
 """
 
 import json
-from typing import Literal
+import re
+from typing import Literal, TypeVar
 
 from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -12,11 +13,12 @@ from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 Route = Literal["clarify", "research", "capabilities"]
 MAX_REVIEW_ATTEMPTS = 2
+Decision = TypeVar("Decision", bound=BaseModel)
 
 ROUTER_PROMPT = """
 Обработай message. В history лежат предыдущие реплики этой беседы.
@@ -89,6 +91,7 @@ CRITIC_PROMPT = """
 class RouteDecision(BaseModel):
     """По переписке выбирает короткий ответ, описание возможностей или проверку факта."""
 
+    model_config = ConfigDict(extra="forbid")
     route: Route = Field(description="research для факта, clarify для уточнения, capabilities для вопроса о возможностях агента")
     question: str = Field(description="Уточняющий вопрос или готовая вежливая реплика. При поиске оставь пустым.")
     claim: str = Field(description="Для research обязателен полный вопрос или факт с контекстом. Для clarify пустая строка.")
@@ -98,6 +101,7 @@ class RouteDecision(BaseModel):
 class ReviewDecision(BaseModel):
     """Вход — черновик и источники. Выход — решение, замечания и новый запрос."""
 
+    model_config = ConfigDict(extra="forbid")
     approved: bool = Field(description="Вывод и ссылки черновика подтверждаются источниками")
     feedback: str = Field(description="Конкретные исправления при отклонении. Иначе пустая строка.")
     next_query: str = Field(description="Новый поисковый запрос при отклонении. Иначе пустая строка.")
@@ -117,6 +121,32 @@ class FactCheckState(MessagesState, total=False):
     review_attempts: int
 
 
+def request_decision(
+    model: BaseChatModel, schema: type[Decision], prompt: str, data: dict,
+) -> Decision:
+    """Получает модель, схему, инструкцию и данные. Возвращает проверенное решение."""
+    structured = model.with_structured_output(schema, method="json_schema", include_raw=True)
+    correction = ""
+    for _ in range(3):
+        result = structured.invoke([
+            SystemMessage(content=prompt + "\nВерни один полный объект JSON по схеме." + correction),
+            HumanMessage(content=json.dumps(data, ensure_ascii=False)),
+        ])
+        content = result["raw"].text.strip()
+        fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", content, re.IGNORECASE | re.DOTALL)
+        try:
+            return schema.model_validate_json(
+                fenced.group(1) if fenced else content, strict=True,
+            )
+        except ValidationError as error:
+            issues = ", ".join(
+                f"{'.'.join(map(str, issue['loc'])) or 'JSON'} ({issue['type']})"
+                for issue in error.errors(include_input=False)
+            )
+            correction = f"\nИсправь ошибки формата: {issues}. Заполни все поля схемы."
+    raise OutputParserException(f"{schema.__name__}: {issues}")
+
+
 def build_graph(
     model: BaseChatModel,
     search_web: BaseTool,
@@ -125,13 +155,6 @@ def build_graph(
     checkpointer: BaseCheckpointSaver,
 ) -> CompiledStateGraph:
     """Получает модель, средства поиска и хранилище бесед. Возвращает собранный граф."""
-    router = model.with_structured_output(RouteDecision, method="json_schema").with_retry(
-        retry_if_exception_type=(OutputParserException,), stop_after_attempt=2
-    )
-    reviewer = model.with_structured_output(ReviewDecision, method="json_schema").with_retry(
-        retry_if_exception_type=(OutputParserException,), stop_after_attempt=2
-    )
-
     def route_request(state: FactCheckState) -> dict:
         """Читает переписку и решает, ответить сразу или искать сведения."""
         *history, latest = state["messages"]
@@ -139,10 +162,7 @@ def build_graph(
             "message": latest.text,
             "history": [{"role": message.type, "text": message.text} for message in history],
         }
-        decision = router.invoke([
-            SystemMessage(content=ROUTER_PROMPT),
-            HumanMessage(content=json.dumps(request, ensure_ascii=False)),
-        ])
+        decision = request_decision(model, RouteDecision, ROUTER_PROMPT, request)
         if decision.route == "research" and not (decision.claim.strip() and decision.query.strip()):
             decision = RouteDecision(
                 route="clarify", question="Какое утверждение нужно проверить?", claim="", query=""
@@ -204,15 +224,12 @@ def build_graph(
 
     def critic(state: FactCheckState) -> dict:
         """Принимает черновик и источники. Возвращает решение и данные для повторного поиска."""
-        decision = reviewer.invoke([
-            SystemMessage(content=CRITIC_PROMPT),
-            HumanMessage(content=json.dumps({
-                "claim": state["claim"],
-                "draft": state["draft"],
-                "sources": state["sources"],
-                "previous_query": state["query"],
-            }, ensure_ascii=False)),
-        ])
+        decision = request_decision(model, ReviewDecision, CRITIC_PROMPT, {
+            "claim": state["claim"],
+            "draft": state["draft"],
+            "sources": state["sources"],
+            "previous_query": state["query"],
+        })
         approved = decision.approved and bool(state["draft"])
         feedback = decision.feedback.strip() or "Найди дополнительные источники по утверждению."
         next_query = decision.next_query.strip()[:400]
