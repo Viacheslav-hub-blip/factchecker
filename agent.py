@@ -125,7 +125,7 @@ def request_decision(
     model: BaseChatModel, schema: type[Decision], prompt: str, data: dict,
 ) -> Decision:
     """Получает модель, схему, инструкцию и данные. Возвращает проверенное решение."""
-    structured = model.with_structured_output(schema, method="json_schema", include_raw=True)
+    structured = model.with_structured_output(schema, method="json_schema", strict=True, include_raw=True)
     correction = ""
     for _ in range(3):
         result = structured.invoke([

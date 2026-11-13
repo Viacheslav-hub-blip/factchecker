@@ -29,7 +29,7 @@ python -m venv .venv
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
-Откройте `.env` и укажите ключ GigaChat в `GIGACHAT_CREDENTIALS`, а ключ Tavily в `TAVILY_API_KEY`. Этот файл хранится на вашем компьютере. По умолчанию используется `GigaChat-3-Pro`. Для доступа к `GigaChat-3-Ultra` через ключ для физического лица укажите `GIGACHAT_MODEL=GigaChat-3-Ultra` и `GIGACHAT_SCOPE=GIGACHAT_API_PERS`. Если при подключении появится ошибка проверки сертификата, укажите путь к сертификату в `GIGACHAT_CA_BUNDLE_FILE`. Затем выполните команду быстрого запуска.
+Откройте `.env` и укажите ключ OpenRouter в `OPENROUTER_API_KEY`, а ключ Tavily в `TAVILY_API_KEY`. По умолчанию используется `deepseek/deepseek-v4.1-flash-1017`. Чтобы выбрать другую модель с поддержкой JSON Schema, задайте `OPENROUTER_MODEL`. Затем выполните команду быстрого запуска.
 
 ## Пример диалога
 
