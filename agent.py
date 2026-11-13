@@ -5,6 +5,7 @@ researcher, critic, after_review, publish, insufficient.
 import json
 from typing import Literal
 
+from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
@@ -18,16 +19,19 @@ Route = Literal["clarify", "research"]
 MAX_REVIEW_ATTEMPTS = 2
 
 ROUTER_PROMPT = """
-Ты маршрутизатор FactChecker. Сначала распознай простую реплику по примерам ниже.
-Для проверки факта восстанови из диалога, о ком, о чём и о каком периоде идёт речь.
-Выбери research, если факт можно проверить. Сохрани в claim исходный смысл,
-включая отрицания, даты, единицы и условия. Предпосылку вопроса тоже проверяй.
-Например, «Когда Эйнштейн получил Нобелевскую премию за теорию относительности?»
-требует выяснить и год присуждения премии, и за какую работу её присудили.
-В query оставь ключевые имена, событие и период. Сформулируй запрос так,
-чтобы поиск мог найти сведения как в пользу утверждения, так и против него.
-Уточняй, если разные трактовки меняют вывод и история не помогает выбрать.
-Назови, чего именно не хватает. Для «Это было в 1969 году?» спроси «О каком событии речь?».
+Обработай message. В history лежат предыдущие реплики этой беседы.
+Если пользователь продолжает тему или отвечает на уточнение, восстанови
+из ближайших связанных реплик объект, действие и условия. Сохрани то,
+что пользователь не изменил. Предыдущий ответ помогает понять вопрос,
+но наличие ответа в истории не меняет маршрут для проверяемого факта.
+Если вопрос понятен с учётом истории, выбери research. Запиши в claim
+полный вопрос или утверждение, понятное отдельно от диалога. Сохрани
+отрицания, даты, единицы и предпосылки. Не подставляй предполагаемый ответ.
+В query укажи ключевые слова для поиска подтверждений и опровержений.
+Для research заполни claim и query, а question оставь пустым.
+Если из сообщения и истории нельзя выбрать между трактовками, от которых
+зависит ответ, выбери clarify. Задай один вопрос о недостающей детали.
+Оставь claim и query пустыми. Фактический ответ формируется после поиска.
 Если в сообщении есть факт для проверки, обрабатывай его даже после приветствия.
 Для простых реплик выбери clarify, оставь claim и query пустыми и запиши в
 question готовый ответ пользователю. Для близких формулировок также бери
@@ -52,7 +56,7 @@ RESEARCHER_PROMPT = """
 Предпочитай первоисточники. Википедия полезна для контекста, а перепечатки
 одного сообщения считай одним свидетельством.
 Ответь напрямую, как в обычном разговоре. Первым предложением сообщи сам факт,
-поправку или то, что пока неизвестно. Пиши «Нил Армстронг первым ступил на Луну».
+поправку или то, что пока неизвестно.
 В самом ответе не описывай проверку и не пиши «это подтверждается источниками».
 Пропусти метки «Вывод», «Вердикт» и пересказ утверждения.
 Добавь до трёх коротких пояснений, если они нужны для ответа.
@@ -85,9 +89,9 @@ CRITIC_PROMPT = """
 class RouteDecision(BaseModel):
     """По переписке определяет, что ответить сразу или какой факт проверить."""
 
-    route: Route
-    question: str = Field(description="Готовый ответ или вопрос для уточнения. При поиске оставь пустым.")
-    claim: str = Field(description="Утверждение для проверки. Для короткого ответа оставь пустым.")
+    route: Route = Field(description="research для проверяемого факта, clarify для уточнения или простой реплики")
+    question: str = Field(description="Уточняющий вопрос или готовая вежливая реплика. При поиске оставь пустым.")
+    claim: str = Field(description="Для research обязателен полный вопрос или факт с контекстом. Для clarify пустая строка.")
     query: str = Field(description="Текст для поиска. Для короткого ответа оставь пустым.")
 
 
@@ -120,12 +124,24 @@ def build_graph(
     search_wikipedia: BaseTool,
 ) -> CompiledStateGraph:
     """Получает модель и средства поиска. Собирает программу, которая помнит переписку."""
-    router = model.with_structured_output(RouteDecision, method="format_instructions")
-    reviewer = model.with_structured_output(ReviewDecision, method="format_instructions")
+    router = model.with_structured_output(RouteDecision, method="json_schema").with_retry(
+        retry_if_exception_type=(OutputParserException,), stop_after_attempt=2
+    )
+    reviewer = model.with_structured_output(ReviewDecision, method="json_schema").with_retry(
+        retry_if_exception_type=(OutputParserException,), stop_after_attempt=2
+    )
 
     def route_request(state: FactCheckState) -> dict:
         """Читает переписку и решает, ответить сразу или искать сведения."""
-        decision = router.invoke([SystemMessage(content=ROUTER_PROMPT), *state["messages"]])
+        *history, latest = state["messages"]
+        request = {
+            "message": latest.text,
+            "history": [{"role": message.type, "text": message.text} for message in history],
+        }
+        decision = router.invoke([
+            SystemMessage(content=ROUTER_PROMPT),
+            HumanMessage(content=json.dumps(request, ensure_ascii=False)),
+        ])
         if decision.route == "research" and not (decision.claim.strip() and decision.query.strip()):
             decision = RouteDecision(
                 route="clarify", question="Какое утверждение нужно проверить?", claim="", query=""

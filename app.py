@@ -1,5 +1,6 @@
-"""Приём сообщений и отправка ответов. Функции: lifespan, chat."""
+"""Приём сообщений и отправка ответов. Функции: lifespan, chat, chat_error."""
 
+import logging
 import os
 from contextlib import asynccontextmanager
 from threading import Lock
@@ -9,7 +10,7 @@ import httpx
 import httpx2
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from gigachat.exceptions import GigaChatException
+from gigachat.exceptions import GigaChatException, ResponseError
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage
 from langchain_gigachat import GigaChat
@@ -17,6 +18,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agent import Route, build_graph
 from web_tools import extract_pages, search_web, search_wikipedia
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class ChatRequest(BaseModel):
@@ -55,7 +59,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="FactChecker", lifespan=lifespan)
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post(
+    "/chat",
+    response_model=ChatResponse,
+    responses={
+        502: {"description": "Ошибка внешнего сервиса или неверный формат ответа"},
+        503: {"description": "Внешний сервис ограничил частоту запросов"},
+        504: {"description": "Внешний сервис не ответил вовремя"},
+    },
+)
 def chat(body: ChatRequest, request: Request) -> ChatResponse:
     """Получает сообщение и данные запроса. Возвращает ответ и номер беседы."""
     thread_id = body.thread_id or uuid4()
@@ -66,10 +78,38 @@ def chat(body: ChatRequest, request: Request) -> ChatResponse:
                 config={"configurable": {"thread_id": str(thread_id)}},
             )
     except (GigaChatException, httpx.HTTPError, httpx2.HTTPError, OutputParserException) as error:
-        raise HTTPException(status_code=502, detail="Ошибка GigaChat или Tavily.") from error
+        raise chat_error(error) from error
 
     return ChatResponse(
         thread_id=thread_id,
         route=result["route"],
         answer=result["messages"][-1].text,
     )
+
+
+def chat_error(error: Exception) -> HTTPException:
+    """Получает ошибку проверки. Возвращает понятное сообщение для пользователя."""
+    if isinstance(error, OutputParserException):
+        logger.warning("GigaChat: не удалось разобрать ответ модели.")
+        return HTTPException(502, "GigaChat вернул ответ в неожиданном формате. Повторите запрос.")
+
+    service = "GigaChat"
+    status = error.status_code if isinstance(error, ResponseError) else None
+    if isinstance(error, (httpx.HTTPError, httpx2.HTTPError)):
+        if error.request.url.host == "api.tavily.com":
+            service = "Tavily"
+        if isinstance(error, (httpx.HTTPStatusError, httpx2.HTTPStatusError)):
+            status = error.response.status_code
+
+    logger.warning("%s: %s, код ответа: %s", service, type(error).__name__, status)
+    if isinstance(error, (httpx.TimeoutException, httpx2.TimeoutException)):
+        return HTTPException(504, f"{service} не ответил вовремя. Повторите запрос.")
+    if status == 429:
+        return HTTPException(503, f"{service} ограничил частоту запросов. Попробуйте чуть позже.")
+    if status == 402:
+        return HTTPException(502, f"{service} вернул код 402. Проверьте доступный лимит в личном кабинете.")
+    if status in (401, 403):
+        return HTTPException(502, f"{service} отклонил доступ ({status}). Проверьте ключ и права.")
+    if status:
+        return HTTPException(502, f"{service} вернул ошибку ({status}).")
+    return HTTPException(502, f"Не удалось получить ответ от {service}.")
